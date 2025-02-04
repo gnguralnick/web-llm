@@ -9,6 +9,7 @@ import {
   RangeError,
 } from "./error";
 import { ModelIntegrity } from "./integrity";
+import { ChatCompletionMessageParam } from "./openai_api_protocols/chat_completion";
 
 /**
  * Conversation template config
@@ -116,6 +117,7 @@ export interface MLCEngineConfig {
   initProgressCallback?: InitProgressCallback;
   logitProcessorRegistry?: Map<string, LogitProcessor>;
   logLevel?: LogLevel;
+  cachedPrefixes?: ChatCompletionMessageParam[][];
 }
 
 /**

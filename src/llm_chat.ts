@@ -32,8 +32,12 @@ import {
   PrefillChunkSizeSmallerThanImageError,
   CannotFindImageEmbedError,
 } from "./error";
+import { ChatCompletionMessageParam } from "./openai_api_protocols/chat_completion";
 
 type ImageURL = ChatCompletionContentPartImage.ImageURL;
+
+// Default sequence ID for chat completion
+const CHAT_SEQUENCE_ID = 0;
 
 type KVStateKind = "kv_cache" | "rnn_state" | "hybrid" | "none";
 type ComputeABIKind = "single" | "batch";
@@ -176,6 +180,8 @@ export class LLMChatPipeline {
   private sampleIndices: Int32Array;
   private sampleIndicesDevice: tvmjs.Tensor;
   private topPDevice: tvmjs.Tensor;
+  private seqIdToPrefix: Map<number, number[]>;
+  private nextSequenceId: number;
 
   constructor(
     tvm: tvmjs.Instance,
@@ -221,6 +227,8 @@ export class LLMChatPipeline {
     log.info("token_postproc_method: ", this.token_postproc_method);
     log.info("prepend_space_in_encode: ", this.prepend_space_in_encode);
 
+    this.seqIdToPrefix = new Map<number, number[]>();
+    this.nextSequenceId = 0;
     this.device = this.tvm.webgpu();
 
     // 1. Create VM and read model metadata
@@ -545,9 +553,17 @@ export class LLMChatPipeline {
    */
   resetKVCache() {
     const states = this.getActiveKVStates();
-    for (const state of states) {
-      this.fclearKVCaches(state);
-      this.fKVCacheAddSequence!(state, new tvmjs.Scalar(0, "int64"));
+    // Check whether to keep prefixes in the KV cache
+    if (this.seqIdToPrefix.size === 0) {
+      for (const state of states) {
+        this.fclearKVCaches(state);
+        this.fKVCacheAddSequence!(state, new tvmjs.Scalar(0, "int64"));
+      }
+    } else {
+      for (const state of states) {
+        this.fKVCacheRemoveSequence!(state, new tvmjs.Scalar(0, "int64"));
+        this.fKVCacheAddSequence!(state, new tvmjs.Scalar(0, "int64"));
+      }
     }
     if (this.slidingWindowSize != -1 && this.kvCache !== undefined) {
       this.fKVCacheEnableSlidingWindowForSeq(
@@ -717,6 +733,15 @@ export class LLMChatPipeline {
     await this.tvm.asyncLoadWebGPUPipelines(this.vm.getInternalModule());
   }
 
+  matchPrefix(inputTokens: number[], prefixTokens: number[]): number {
+    for (let i = 0; i < prefixTokens.length; i++) {
+      if (inputTokens[i] !== prefixTokens[i]) {
+        return i;
+      }
+    }
+    return prefixTokens.length;
+  }
+
   /**
    * Generate the first token given input prompt
    */
@@ -725,11 +750,17 @@ export class LLMChatPipeline {
     msgRole: Role, // either user or tool
     inp_role_str?: string,
     genConfig?: GenerationConfig,
+    seqID = CHAT_SEQUENCE_ID,
   ): Promise<void> {
-    if (msgRole !== Role.user && msgRole !== Role.tool) {
-      throw new MessageOrderError(
-        "The last message should be from `user` or `tool`.",
-      );
+    if (seqID === CHAT_SEQUENCE_ID) {
+      if (msgRole !== Role.user && msgRole !== Role.tool) {
+        throw new MessageOrderError(
+          "The last message should be from `user` or `tool`.",
+        );
+      }
+    } else {
+      // Set the input as system prompt during prefix prefilling
+      this.conversation.override_system_message = inp;
     }
     if (this.resetStatsPerPrefill) {
       this.resetRuntimeStats();
@@ -832,21 +863,23 @@ export class LLMChatPipeline {
     }
 
     // 0. Get inputData from conversation
-    if (conversation.isTextCompletion) {
-      conversation.prompt = inp;
-    } else {
-      conversation.appendMessage(msgRole, inp, inp_role_str);
-      if (genConfig?.enable_thinking === false) {
-        // TODO(Charlie): In future we should make emptyThinkingBlockStr configurable.
-        const emptyThinkingBlockStr = "<think>\n\n</think>\n\n";
-        const encoded = this.tokenizer.encode(emptyThinkingBlockStr);
-        this.outputIds.push(...encoded);
-        conversation.appendEmptyThinkingReplyHeader(
-          Role.assistant,
-          emptyThinkingBlockStr,
-        );
+    if (seqID === CHAT_SEQUENCE_ID) {
+      if (conversation.isTextCompletion) {
+        conversation.prompt = inp;
       } else {
-        conversation.appendReplyHeader(Role.assistant);
+        conversation.appendMessage(msgRole, inp, inp_role_str);
+        if (genConfig?.enable_thinking === false) {
+          // TODO(Charlie): In future we should make emptyThinkingBlockStr configurable.
+          const emptyThinkingBlockStr = "<think>\n\n</think>\n\n";
+          const encoded = this.tokenizer.encode(emptyThinkingBlockStr);
+          this.outputIds.push(...encoded);
+          conversation.appendEmptyThinkingReplyHeader(
+            Role.assistant,
+            emptyThinkingBlockStr,
+          );
+        } else {
+          conversation.appendReplyHeader(Role.assistant);
+        }
       }
     }
     const retGetInputData = this.getInputData();
@@ -870,11 +903,78 @@ export class LLMChatPipeline {
       throw new CannotFindImageEmbedError();
     }
 
+    let maxMatchedLen = -1;
+    let matchedSeqId = -1;
+
+    // Prefix matching and forking
+    const inputTokens = inputData.flat() as number[];
+    for (const [id, prefixTokens] of this.seqIdToPrefix) {
+      const matchedLen = this.matchPrefix(inputTokens, prefixTokens);
+      if (matchedLen > maxMatchedLen) {
+        maxMatchedLen = matchedLen;
+        matchedSeqId = id;
+      }
+    }
+
+    // If a match is found, fork the sequence
+    const activeStates = this.getActiveKVStates();
+    if (matchedSeqId !== -1 && maxMatchedLen > 0) {
+      log.info(
+        "Forking sequence",
+        matchedSeqId,
+        "at position",
+        maxMatchedLen,
+      );
+      if (seqID === CHAT_SEQUENCE_ID) {
+        for (const state of activeStates) {
+          this.fKVCacheRemoveSequence!(
+            state,
+            new tvmjs.Scalar(seqID, "int64"),
+          );
+        }
+      }
+      this.tvm.beginScope();
+      const forkSequence = this.tvm.getGlobalFunc(
+        "vm.builtin.kv_state_fork_sequence",
+      );
+      for (const state of activeStates) {
+        forkSequence(
+          state,
+          new tvmjs.Scalar(matchedSeqId, "int64"), // fork_parent_id
+          new tvmjs.Scalar(seqID, "int64"), // fork_child_id
+          new tvmjs.Scalar(maxMatchedLen, "int64"), // fork_position
+        );
+      }
+      this.tvm.endScope();
+    } else if (seqID !== CHAT_SEQUENCE_ID) {
+      // If no match is found, add the new sequence to the KV states
+      log.info("Adding new sequence to KV states: ", seqID);
+      for (const state of activeStates) {
+        this.fKVCacheAddSequence!(state, new tvmjs.Scalar(seqID, "int64"));
+      }
+    }
+
+    // Add the new sequence to the seqIdToPrefix map (if it is a prefix)
+    if (seqID !== CHAT_SEQUENCE_ID) {
+      this.seqIdToPrefix.set(seqID, inputTokens);
+    }
+
     // 1. Chunk inputData to embed and forward in one shot for each, minimize intermediate data
-    const retGetChunks = getChunkedPrefillInputData(
-      inputData,
-      this.prefillChunkSize,
-    );
+    let retGetChunks;
+    if (maxMatchedLen === -1) {
+      retGetChunks = getChunkedPrefillInputData(
+        inputData,
+        this.prefillChunkSize,
+      );
+    } else {
+      // If a matched prefix exists, only forward the remaining tokens
+      retGetChunks = getChunkedPrefillInputData(
+        inputData.map((arr) =>
+          Array.isArray(arr) ? arr.slice(maxMatchedLen) : arr,
+        ),
+        this.prefillChunkSize,
+      );
+    }
     const chunks: Array<Array<number> | ImageURL>[] = retGetChunks[0];
     const chunkLens: Array<number> = retGetChunks[1];
 
@@ -886,7 +986,7 @@ export class LLMChatPipeline {
       const chunkLen = chunkLens[i];
       const prevFilledLen = this.filledKVCacheLength;
       logits = this.tvm.detachFromCurrentScope(
-        await this.embedAndForward(chunk, chunkLen),
+        await this.embedAndForward(chunk, chunkLen, seqID),
       );
       if (this.filledKVCacheLength !== prevFilledLen + chunkLen) {
         throw new Error(
@@ -909,6 +1009,41 @@ export class LLMChatPipeline {
     this.curRoundPrefillTotalTime += (tend - tstart) / 1e3;
 
     this.processNextToken(nextToken, genConfig);
+  }
+
+  async prefillConvSequence(
+    messages: ChatCompletionMessageParam[],
+    inp_role_str?: string,
+    genConfig?: GenerationConfig,
+  ): Promise<void> {
+    for (const message of messages) {
+      this.nextSequenceId = this.nextSequenceId + 1;
+      const newSeqId = this.nextSequenceId;
+      // Call the regular prefillStep with the new seqID
+      if (typeof message.content === "string") {
+        // Support long system prompt
+        if (message.role === "system") {
+          await this.prefillStep(
+            message.content,
+            Role.tool,
+            inp_role_str,
+            genConfig,
+            newSeqId,
+          );
+        } else {
+          throw Error(
+            "Invalid role in prefix message: " +
+              message.role +
+              ", expected 'system'.",
+          );
+        }
+      } else {
+        throw Error(
+          "Invalid content in prefix message, does not support image input.",
+        );
+      }
+    }
+    this.conversation.reset();
   }
 
   async decodeStep(genConfig?: GenerationConfig): Promise<void> {
@@ -1186,14 +1321,16 @@ export class LLMChatPipeline {
    *
    * @param inputData data to embed and forward
    * @param inputDataLen length of this inputData, should smaller than prefill chunk size.
-   * @returns The logits returned by this forward as tvmjs.Tensor on GPU.
+   * @param seqID sequence ID of the input data in KV cache for prefix caching
+   * @returns The logits returned by this forward as tvmjs.NDArray on GPU.
    *
    * @note Precondition: inputData's data length is smaller than prefill chunk size
    */
   private async embedAndForward(
     inputData: Array<Array<number> | ImageURL>,
     inputDataLen: number,
-  ): Promise<tvmjs.Tensor> {
+    seqID = CHAT_SEQUENCE_ID,
+  ): Promise<tvmjs.NDArray> {
     if (inputDataLen > this.prefillChunkSize) {
       throw new Error(
         "InternalError: expect inputDataLen <= this.prefillChunkSize.",
@@ -1230,7 +1367,7 @@ export class LLMChatPipeline {
 
     // 3. Forward the concatenated embeddings
     const inputLenShape = this.tvm.makeShapeTuple([inputDataLen]);
-    const seqIdsTuple = this.tvm.makeShapeTuple([0]);
+    const seqIdsTuple = this.tvm.makeShapeTuple([seqID]);
     const forwardStates = this.getActiveKVStates();
     for (const state of forwardStates) {
       this.fKVCacheBeginForward!(state, seqIdsTuple, inputLenShape);
