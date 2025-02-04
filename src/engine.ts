@@ -472,7 +472,6 @@ export class MLCEngine implements MLCEngineInterface {
     if (genConfig !== undefined) {
       postInitAndCheckGenerationConfigValues(genConfig);
     }
-    console.log("prefill in _generate, input: ", input);
     await this.prefill(input, pipeline, chatConfig, genConfig);
 
     while (!pipeline.stopped()) {
