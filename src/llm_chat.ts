@@ -919,12 +919,7 @@ export class LLMChatPipeline {
     // If a match is found, fork the sequence
     const activeStates = this.getActiveKVStates();
     if (matchedSeqId !== -1 && maxMatchedLen > 0) {
-      log.info(
-        "Forking sequence",
-        matchedSeqId,
-        "at position",
-        maxMatchedLen,
-      );
+      log.info("Forking sequence", matchedSeqId, "at position", maxMatchedLen);
       if (seqID === CHAT_SEQUENCE_ID) {
         for (const state of activeStates) {
           this.fKVCacheRemoveSequence!(
