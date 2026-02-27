@@ -940,6 +940,14 @@ export class LLMChatPipeline {
       const glbTokens = 12 * (12 + 1);
       return subTokens + 1 + glbTokens;
     }
+    if (modelType === "internvl_chat") {
+      const [cropH, cropW] = this.calculateCropShape(imageHeight, imageWidth);
+      const maxTiles = this.config.model_config?.max_dynamic_patch ?? 12;
+      // Include thumbnail only when max_dynamic_patch > 1 (with max_dynamic_patch=1,
+      // thumbnail is identical to the single tile so compiled model skips it)
+      const numTiles = cropH * cropW + (maxTiles > 1 ? 1 : 0);
+      return numTiles * 256;
+    }
     // For models with fixed embed size (e.g. Gemma3V)
     const mmTokens = this.config.model_config?.mm_tokens_per_image;
     if (mmTokens !== undefined) {
@@ -952,13 +960,45 @@ export class LLMChatPipeline {
   }
 
   /**
-   * Calculate resize dimensions for Phi3-V model.
+   * Calculate resize dimensions based on model type.
    * Based on vlm_utils.cc CalculateResizeShape
    */
   private calculateResizeShape(
     imageHeight: number,
     imageWidth: number,
   ): [number, number] {
+    const modelType = this.config.model_type;
+    if (modelType === "internvl_chat") {
+      const imageSize = 448;
+      const maxTiles = this.config.model_config?.max_dynamic_patch ?? 12;
+      const aspect = imageWidth / imageHeight;
+      const area = imageWidth * imageHeight;
+
+      let bestI = 1,
+        bestJ = 1;
+      let bestDiff = Infinity;
+      for (let n = 1; n <= maxTiles; n++) {
+        for (let i = 1; i <= n; i++) {
+          for (let j = 1; j <= n; j++) {
+            if (i * j > maxTiles) continue;
+            const targetAspect = i / j;
+            const diff = Math.abs(targetAspect - aspect);
+            if (diff < bestDiff) {
+              bestDiff = diff;
+              bestI = i;
+              bestJ = j;
+            } else if (diff === bestDiff) {
+              if (area > 0.5 * imageSize * imageSize * i * j) {
+                bestI = i;
+                bestJ = j;
+              }
+            }
+          }
+        }
+      }
+      return [bestJ * imageSize, bestI * imageSize];
+    }
+    // phi3_v
     const hdNum = 16;
     const ratio = imageWidth / imageHeight;
     let scale = 1;
@@ -972,13 +1012,22 @@ export class LLMChatPipeline {
   }
 
   /**
-   * Calculate crop dimensions for Phi3-V model.
+   * Calculate crop dimensions based on model type.
    * Based on vlm_utils.cc CalculateCropShape / CalculatePadShape
    */
   private calculateCropShape(
     imageHeight: number,
     imageWidth: number,
   ): [number, number] {
+    const modelType = this.config.model_type;
+    if (modelType === "internvl_chat") {
+      const [resizeH, resizeW] = this.calculateResizeShape(
+        imageHeight,
+        imageWidth,
+      );
+      return [resizeH / 448, resizeW / 448];
+    }
+    // phi3_v
     const [resizedHeight, resizedWidth] = this.calculateResizeShape(
       imageHeight,
       imageWidth,
