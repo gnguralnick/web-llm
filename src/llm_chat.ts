@@ -297,23 +297,58 @@ export class LLMChatPipeline {
       ),
     );
 
-    // Create PagedKVCache; we do not expose KVCache config for now
-    const fcreateCache = this.vm.getFunction("create_tir_paged_kv_cache");
+    // Create KV state based on model's kv_state_kind
+    const kvStateKind: string = metadata.kv_state_kind ?? "kv_cache";
     const defaultPageSize = 16;
     const defaultMaxNumSequence = 1;
     const maxTotalSeqLen =
       this.slidingWindowSize != -1
         ? this.slidingWindowSize
         : this.contextWindowSize;
-    this.kvCache = this.tvm.detachFromCurrentScope(
-      fcreateCache(
-        this.tvm.makeShapeTuple([defaultMaxNumSequence]), // max_num_sequence
-        this.tvm.makeShapeTuple([maxTotalSeqLen]), // max_total_sequence_length
-        this.tvm.makeShapeTuple([this.prefillChunkSize]), // prefill_chunk_size
-        this.tvm.makeShapeTuple([defaultPageSize]), // page_size, hard coded for now
-        this.tvm.makeShapeTuple([this.slidingWindowSize != -1 ? 1 : 0]),
-      ),
-    );
+
+    if (kvStateKind === "kv_cache" || kvStateKind === "hybrid") {
+      const fcreateCache = this.vm.getFunction("create_tir_paged_kv_cache");
+      const pagedKVCache = this.tvm.detachFromCurrentScope(
+        fcreateCache(
+          this.tvm.makeShapeTuple([defaultMaxNumSequence]), // max_num_sequence
+          this.tvm.makeShapeTuple([maxTotalSeqLen]), // max_total_sequence_length
+          this.tvm.makeShapeTuple([this.prefillChunkSize]), // prefill_chunk_size
+          this.tvm.makeShapeTuple([defaultPageSize]), // page_size, hard coded for now
+          this.tvm.makeShapeTuple([this.slidingWindowSize != -1 ? 1 : 0]),
+        ),
+      );
+
+      if (kvStateKind === "hybrid") {
+        const fcreateRNN = this.vm.getFunction("create_rnn_state");
+        const rnnState = this.tvm.detachFromCurrentScope(
+          fcreateRNN(
+            this.tvm.makeShapeTuple([defaultMaxNumSequence]),
+            this.tvm.makeShapeTuple([1]), // max_history
+          ),
+        );
+        const fhybridCreate = this.tvm.detachFromCurrentScope(
+          this.tvm.getGlobalFunc("vm.builtin.hybrid_state_create"),
+        );
+        this.kvCache = this.tvm.detachFromCurrentScope(
+          fhybridCreate(pagedKVCache, rnnState),
+        );
+        pagedKVCache.dispose();
+        rnnState.dispose();
+        fhybridCreate.dispose();
+      } else {
+        this.kvCache = pagedKVCache;
+      }
+    } else if (kvStateKind === "rnn_state") {
+      const fcreateRNN = this.vm.getFunction("create_rnn_state");
+      this.kvCache = this.tvm.detachFromCurrentScope(
+        fcreateRNN(
+          this.tvm.makeShapeTuple([defaultMaxNumSequence]),
+          this.tvm.makeShapeTuple([1]), // max_history
+        ),
+      );
+    } else {
+      throw new Error(`Unsupported kv_state_kind: ${kvStateKind}`);
+    }
 
     this.filledKVCacheLength = 0;
     this.resetChat(); // especially needed for PagedKVCache as we need to call fKVCacheAddSequence
@@ -940,6 +975,10 @@ export class LLMChatPipeline {
       const glbTokens = 12 * (12 + 1);
       return subTokens + 1 + glbTokens;
     }
+    if (modelType === "qwen3_5_v") {
+      // (image_size / patch_size / spatial_merge_size)^2 = (448/16/2)^2 = 196
+      return 196;
+    }
     // For models with fixed embed size (e.g. Gemma3V)
     const mmTokens = this.config.model_config?.mm_tokens_per_image;
     if (mmTokens !== undefined) {
@@ -959,6 +998,17 @@ export class LLMChatPipeline {
     imageHeight: number,
     imageWidth: number,
   ): [number, number] {
+    const modelType = this.config.model_type;
+    if (modelType === "qwen3_5_v") {
+      const imageSize = this.config.model_config?.image_size;
+      if (imageSize === undefined) {
+        throw new Error(
+          "qwen3_5_v requires image_size in model_config in mlc-chat-config.json.",
+        );
+      }
+      return [imageSize, imageSize];
+    }
+    // phi3_v
     const hdNum = 16;
     const ratio = imageWidth / imageHeight;
     let scale = 1;
@@ -979,6 +1029,11 @@ export class LLMChatPipeline {
     imageHeight: number,
     imageWidth: number,
   ): [number, number] {
+    const modelType = this.config.model_type;
+    if (modelType === "qwen3_5_v") {
+      return [1, 1]; // Single tile, no dynamic tiling
+    }
+    // phi3_v
     const [resizedHeight, resizedWidth] = this.calculateResizeShape(
       imageHeight,
       imageWidth,
@@ -1607,21 +1662,31 @@ export class LLMChatPipeline {
             numPromptTokens += encoded.length;
             curTokens.push(...encoded);
           } else {
-            // Insert BOI wrapping if configured (e.g. Gemma3V: \n + BOI token before image)
-            const boiToken = this.config.model_config?.boi_token_index;
+            // Insert vision-start wrapping token before image if configured
+            const boiToken =
+              this.config.model_config?.boi_token_index ??
+              this.config.model_config?.vision_start_token_id;
             if (boiToken !== undefined) {
-              const nlTokens = this.tokenizer.encode("\n");
-              curTokens.push(...nlTokens);
+              if (
+                this.config.model_config?.boi_insert_newline !== false &&
+                this.config.model_config?.vision_start_token_id === undefined
+              ) {
+                const nlTokens = this.tokenizer.encode("\n");
+                curTokens.push(...nlTokens);
+                numPromptTokens += nlTokens.length;
+              }
               curTokens.push(boiToken);
-              numPromptTokens += nlTokens.length + 1;
+              numPromptTokens += 1;
             }
             // push curTokens to ret, push imageUrl, create a new curTokens
             ret.push([...curTokens]);
             ret.push(curPromptContent);
             numPromptTokens += getEmbedSize(curPromptContent);
             curTokens = [];
-            // Insert EOI token after image if configured
-            const eoiToken = this.config.model_config?.eoi_token_index;
+            // Insert vision-end wrapping token after image if configured
+            const eoiToken =
+              this.config.model_config?.eoi_token_index ??
+              this.config.model_config?.vision_end_token_id;
             if (eoiToken !== undefined) {
               curTokens.push(eoiToken);
               numPromptTokens += 1;
