@@ -1011,33 +1011,46 @@ export class LLMChatPipeline {
     inp_role_str?: string,
     genConfig?: GenerationConfig,
   ): Promise<void> {
+    // Separate system message from any additional user messages.
+    // All messages are prefilled as ONE combined sequence (one seqId) so that
+    // matchPrefix() can fork the KV cache for system-only OR system+user prefixes.
+    let systemContent: string | undefined = undefined;
+    const userContents: string[] = [];
     for (const message of messages) {
-      this.nextSequenceId = this.nextSequenceId + 1;
-      const newSeqId = this.nextSequenceId;
-      // Call the regular prefillStep with the new seqID
-      if (typeof message.content === "string") {
-        // Support long system prompt
-        if (message.role === "system") {
-          await this.prefillStep(
-            message.content,
-            Role.tool,
-            inp_role_str,
-            genConfig,
-            newSeqId,
-          );
-        } else {
-          throw Error(
-            "Invalid role in prefix message: " +
-              message.role +
-              ", expected 'system'.",
-          );
-        }
-      } else {
+      if (typeof message.content !== "string") {
         throw Error(
           "Invalid content in prefix message, does not support image input.",
         );
       }
+      if (message.role === "system") {
+        systemContent = message.content;
+      } else if (message.role === "user") {
+        userContents.push(message.content);
+      } else {
+        throw Error(
+          "Invalid role in prefix message: " +
+            message.role +
+            ", expected 'system' or 'user'.",
+        );
+      }
     }
+    if (systemContent === undefined) {
+      throw Error("Prefix must include a system message.");
+    }
+    this.nextSequenceId = this.nextSequenceId + 1;
+    const newSeqId = this.nextSequenceId;
+    // Pre-append any user messages to the conversation so that getInputData()
+    // inside prefillStep renders [system + user...] as one flat token array.
+    for (const u of userContents) {
+      this.conversation.appendMessage(Role.user, u);
+    }
+    await this.prefillStep(
+      systemContent,
+      Role.tool,
+      inp_role_str,
+      genConfig,
+      newSeqId,
+    );
     this.conversation.reset();
   }
 
@@ -1325,7 +1338,7 @@ export class LLMChatPipeline {
     inputData: Array<Array<number> | ImageURL>,
     inputDataLen: number,
     seqID = CHAT_SEQUENCE_ID,
-  ): Promise<tvmjs.NDArray> {
+  ): Promise<tvmjs.Tensor> {
     if (inputDataLen > this.prefillChunkSize) {
       throw new Error(
         "InternalError: expect inputDataLen <= this.prefillChunkSize.",
