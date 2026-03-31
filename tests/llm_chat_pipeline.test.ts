@@ -142,6 +142,8 @@ function createPipeline(): PipelineLike {
   pipeline["tokenLogprobArray"] = [];
   pipeline["curRoundDecodingTotalTokens"] = 0;
   pipeline["curRoundDecodingTotalTime"] = 0;
+  pipeline["seqIdToPrefix"] = new Map<number, number[]>();
+  pipeline["nextSequenceId"] = 0;
   return pipeline;
 }
 
