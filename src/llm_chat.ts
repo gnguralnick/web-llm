@@ -1077,13 +1077,25 @@ export class LLMChatPipeline {
   }
 
   /**
-   * Calculate resize dimensions for Phi3-V model.
-   * Based on vlm_utils.cc CalculateResizeShape
+   * Calculate resize dimensions for the vision model.
+   * Phi3-V: aspect-ratio preserving resize based on vlm_utils.cc CalculateResizeShape.
+   * Gemma3-V: fixed square resize to image_size from model_config.
    */
   private calculateResizeShape(
     imageHeight: number,
     imageWidth: number,
   ): [number, number] {
+    const modelType = this.config.model_type;
+    if (modelType === "gemma3_v") {
+      const imageSize = this.config.model_config?.image_size;
+      if (imageSize === undefined) {
+        throw new Error(
+          "gemma3_v requires image_size in model_config for resize.",
+        );
+      }
+      return [imageSize, imageSize];
+    }
+    // Phi3-V default
     const hdNum = 16;
     const ratio = imageWidth / imageHeight;
     let scale = 1;
@@ -1097,13 +1109,19 @@ export class LLMChatPipeline {
   }
 
   /**
-   * Calculate crop dimensions for Phi3-V model.
-   * Based on vlm_utils.cc CalculateCropShape / CalculatePadShape
+   * Calculate crop/tile dimensions for the vision model.
+   * Phi3-V: tiles image into 336x336 patches (vlm_utils.cc CalculateCropShape).
+   * Gemma3-V: single tile (no tiling).
    */
   private calculateCropShape(
     imageHeight: number,
     imageWidth: number,
   ): [number, number] {
+    const modelType = this.config.model_type;
+    if (modelType === "gemma3_v") {
+      return [1, 1];
+    }
+    // Phi3-V default
     const [resizedHeight, resizedWidth] = this.calculateResizeShape(
       imageHeight,
       imageWidth,
