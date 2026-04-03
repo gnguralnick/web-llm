@@ -1086,11 +1086,11 @@ export class LLMChatPipeline {
     imageWidth: number,
   ): [number, number] {
     const modelType = this.config.model_type;
-    if (modelType === "qwen3_5_v") {
+    if (modelType === "qwen3_5_vision") {
       const imageSize = this.config.model_config?.image_size;
       if (imageSize === undefined) {
         throw new Error(
-          "qwen3_5_v requires image_size in model_config for resize.",
+          "qwen3_5_vision requires image_size in model_config for resize.",
         );
       }
       return [imageSize, imageSize];
@@ -1118,7 +1118,7 @@ export class LLMChatPipeline {
     imageWidth: number,
   ): [number, number] {
     const modelType = this.config.model_type;
-    if (modelType === "qwen3_5_v") {
+    if (modelType === "qwen3_5_vision") {
       return [1, 1];
     }
     // Phi3-V default
@@ -1147,7 +1147,7 @@ export class LLMChatPipeline {
       const glbTokens = 12 * (12 + 1);
       return subTokens + 1 + glbTokens;
     }
-    if (modelType === "qwen3_5_v") {
+    if (modelType === "qwen3_5_vision") {
       // (image_size / patch_size / spatial_merge_size)^2 = (448/16/2)^2 = 196
       const imageSize = this.config.model_config?.image_size ?? 448;
       const patchSize = 16;
